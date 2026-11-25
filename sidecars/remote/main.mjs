@@ -18,6 +18,8 @@ import {
   remoteClickScreen,
   listConversationsAndWorkspaces,
   getConversationMessages,
+  getConfiguredSshHosts,
+  bindConversationSshHost,
   getDefaultWorkspaces,
   listDirectoryTree,
   readWorkspaceFile,
@@ -29,7 +31,7 @@ import { createPublicTunnelManager } from '../../lib/tunnel.mjs';
 import { createTailscaleManager } from '../../lib/tailscale.mjs';
 import { buildSidebarPayload, startSidebarInjector } from '../../lib/sidebar-inject.mjs';
 
-const VERSION = '2.6.0';
+const VERSION = '2.7.0';
 const SELF_FILE = fileURLToPath(import.meta.url);
 const SELF_MTIME = (() => { try { return statSync(SELF_FILE).mtimeMs; } catch { return 0; } })();
 
@@ -279,6 +281,7 @@ function persistRuntime() {
       ...(payload.publicUrl ? [{ name: `公网跨网 (${payload.tunnelProvider})`, address: 'public', url: payload.publicUrl }] : []),
       ...lanList.map(item => ({ name: item.name, address: item.address, url: payload.lanUrl }))
     ],
+    sshHostLinks: payload.sshHostLinks || [],
     primaryUrl: payload.activeUrl,
     startedAt: new Date().toISOString()
   });
@@ -383,15 +386,26 @@ async function syncClientInBackground() {
     bgClientSnapshot = await getClientCapabilities(false);
     await processConversationQueues();
     if (sseClients.size > 0) {
-      const st = await buildFullState('', lastBroadcastRev, lastBroadcastConvoId, lastBroadcastTurnCount);
-      if (!st.unchanged && st.rev) {
-        lastBroadcastRev = st.rev;
-        lastBroadcastConvoId = st.activeConversationId || lastBroadcastConvoId;
-        if (st.turnCount) lastBroadcastTurnCount = st.turnCount;
-        const encryptedState = encryptE2eePayload(JSON.stringify(st), config.token);
-        const frame = `event: state\ndata: ${encryptedState}\n\n`;
-        for (const res of sseClients) {
-          try { res.write(frame); } catch { sseClients.delete(res); }
+      // Group connected SSE clients by their sshFilter so each SSH host link gets its own filtered state
+      const byFilter = new Map();
+      for (const res of sseClients) {
+        const f = res.sshFilter || '';
+        if (!byFilter.has(f)) byFilter.set(f, []);
+        byFilter.get(f).push(res);
+      }
+      for (const [sshFilter, clientList] of byFilter.entries()) {
+        const st = await buildFullState('', sshFilter ? '' : lastBroadcastRev, sshFilter ? '' : lastBroadcastConvoId, sshFilter ? 0 : lastBroadcastTurnCount, sshFilter);
+        if (!st.unchanged && st.rev) {
+          if (!sshFilter) {
+            lastBroadcastRev = st.rev;
+            lastBroadcastConvoId = st.activeConversationId || lastBroadcastConvoId;
+            if (st.turnCount) lastBroadcastTurnCount = st.turnCount;
+          }
+          const encryptedState = encryptE2eePayload(JSON.stringify(st), config.token);
+          const frame = `event: state\ndata: ${encryptedState}\n\n`;
+          for (const res of clientList) {
+            try { res.write(frame); } catch { sseClients.delete(res); }
+          }
         }
       }
     }
@@ -399,13 +413,23 @@ async function syncClientInBackground() {
 }
 setInterval(syncClientInBackground, 280);
 
-async function buildFullState(requestedId = '', clientRev = '', clientConvoId = '', clientTurnCount = 0) {
+async function buildFullState(requestedId = '', clientRev = '', clientConvoId = '', clientTurnCount = 0, sshFilter = '') {
   const client = bgClientSnapshot.connected ? bgClientSnapshot : await getClientCapabilities(false);
-  const { conversations, workspaceGroups } = listConversationsAndWorkspaces(client.summaries || []);
-  const activeId = requestedId || client.activeConversationId || conversations[0]?.conversationId || '';
-  const convoData = getConversationMessages(activeId);
+  const cleanFilter = String(sshFilter || '').trim();
+  const { conversations, workspaceGroups, sshHosts } = listConversationsAndWorkspaces(client.summaries || [], cleanFilter);
+  let activeId = requestedId;
+  if (!activeId) {
+    if (cleanFilter && cleanFilter !== 'all') {
+      // If viewing a specific SSH host link, only select client.activeConversationId if it belongs to this SSH host!
+      const matchesFilter = conversations.some(c => c.conversationId === client.activeConversationId);
+      activeId = matchesFilter ? client.activeConversationId : (conversations[0]?.conversationId || '');
+    } else {
+      activeId = client.activeConversationId || conversations[0]?.conversationId || '';
+    }
+  }
+  const convoData = activeId ? getConversationMessages(activeId) : { conversationId: '', turns: [], stepCount: 0, mtimeMs: 0, byteSize: 0, workspaceHints: [] };
   const matchingSummary = conversations.find(c => c.conversationId === convoData.conversationId);
-  const title = matchingSummary?.title || convoData.title || '任务会话';
+  const title = matchingSummary?.title || convoData.title || (cleanFilter && cleanFilter !== 'all' ? `SSH: ${cleanFilter} (新会话)` : '任务会话');
 
   const turns = convoData.turns ? [...convoData.turns] : [];
   const ls = client.liveStream;
@@ -525,7 +549,8 @@ async function buildFullState(requestedId = '', clientRev = '', clientConvoId = 
     conversations.length,
     conversations[0]?.updatedAtMs || 0,
     client.activeConversationId || '',
-    client.model || ''
+    client.model || '',
+    cleanFilter || 'all'
   ].join(':');
 
   if (clientRev && clientRev === rev) {
@@ -568,6 +593,8 @@ async function buildFullState(requestedId = '', clientRev = '', clientConvoId = 
     rev,
     turnCount: turns.length,
     hostName: hostname(),
+    sshFilter: cleanFilter || 'all',
+    sshHosts: sshHosts || [],
     client: clientMeta,
     activeConversationId: convoData.conversationId,
     title,
@@ -667,7 +694,8 @@ const server = createServer(async (req, res) => {
 
     // Embed AES-256-GCM E2EE encrypted initialState directly in first HTML response
     // so mobile browser renders readable conversation in 0ms (0 extra HTTP round-trip) while keeping 100% E2EE security!
-    const rawInitialState = await buildFullState('', '');
+    const sshFilter = url.searchParams.get('ssh') || '';
+    const rawInitialState = await buildFullState('', '', '', 0, sshFilter);
     const encryptedInitialState = JSON.parse(encryptE2eePayload(JSON.stringify(rawInitialState), config.token));
     const cookieHeader = `agy_remote_session=${encodeURIComponent(config.token)}; Path=/; HttpOnly; SameSite=Lax`;
     sendCompressed(
@@ -675,7 +703,7 @@ const server = createServer(async (req, res) => {
       res,
       200,
       'text/html; charset=utf-8',
-      renderRemoteWebIdeHtml({ token: config.token, hostName: hostname(), initialState: encryptedInitialState }),
+      renderRemoteWebIdeHtml({ token: config.token, hostName: hostname(), sshFilter, initialState: encryptedInitialState }),
       { 'Set-Cookie': cookieHeader }
     );
     return;
@@ -709,6 +737,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/events') {
+      res.sshFilter = url.searchParams.get('ssh') || '';
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
@@ -726,7 +755,8 @@ const server = createServer(async (req, res) => {
       const clientRev = url.searchParams.get('rev') || '';
       const baseConvo = url.searchParams.get('baseConvo') || '';
       const baseTurns = Number(url.searchParams.get('baseTurns') || 0);
-      const fullState = await buildFullState(requestedId, clientRev, baseConvo, baseTurns);
+      const sshFilter = url.searchParams.get('ssh') || '';
+      const fullState = await buildFullState(requestedId, clientRev, baseConvo, baseTurns, sshFilter);
       sendCompressed(req, res, 200, 'application/json; charset=utf-8', JSON.stringify(fullState));
       return;
     }
@@ -738,7 +768,25 @@ const server = createServer(async (req, res) => {
         sendCompressed(req, res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: '消息不能为空' }));
         return;
       }
+      const sshHost = String(body.sshHost || url.searchParams.get('ssh') || '').trim();
+      const isNewSession = Boolean(body.createNew) || !body.conversationId;
+      let dispatchedPrompt = cleanPrompt;
+
+      // If user is on a dedicated SSH host link (e.g. ?ssh=58.61.156.10) and starts a new conversation,
+      // automatically inject the SSH server target context so they don't have to type "ssh user@host" manually!
+      if (sshHost && sshHost !== 'all' && sshHost !== 'local' && isNewSession) {
+        const cfgHosts = getConfiguredSshHosts();
+        const matched = cfgHosts.find(x => x.host === sshHost || x.hostname === sshHost);
+        const sshTarget = matched?.sshTarget || sshHost;
+        if (!cleanPrompt.toLowerCase().includes(sshHost.toLowerCase())) {
+          dispatchedPrompt = `[SSH 远程服务器绑定: 本会话工作在远程服务器 ${sshTarget} 上，请通过 ssh ${sshTarget} 在该远程服务器上执行所有代码读写、计算与研究任务]\n${cleanPrompt}`;
+        }
+      }
+
       const targetCid = String(body.conversationId || bgClientSnapshot.activeConversationId || '');
+      if (targetCid && sshHost && sshHost !== 'all') {
+        bindConversationSshHost(targetCid, sshHost);
+      }
       if (!convoQueues.has(targetCid)) convoQueues.set(targetCid, []);
       const qList = convoQueues.get(targetCid);
       const hasInFlight = qList.some(it => it.status === 'active') || Boolean(bgClientSnapshot.liveStream?.isRunning && bgClientSnapshot.liveStream?.conversationId === targetCid);
@@ -746,6 +794,7 @@ const server = createServer(async (req, res) => {
       const qItem = {
         qid: ++queueSeq,
         userText: cleanPrompt,
+        dispatchedText: dispatchedPrompt,
         status: (!body.createNew && hasInFlight) ? 'queued' : 'active',
         createdAtMs: Date.now(),
         dispatchedAtMs: (!body.createNew && hasInFlight) ? 0 : Date.now()
@@ -767,12 +816,17 @@ const server = createServer(async (req, res) => {
 
       const result = await remoteSendMessage({
         conversationId: body.conversationId,
-        text: cleanPrompt,
+        text: dispatchedPrompt,
         createNew: Boolean(body.createNew)
       });
-      if (result?.conversationId && result.conversationId !== targetCid) {
-        convoQueues.delete(targetCid);
-        convoQueues.set(result.conversationId, [qItem]);
+      if (result?.conversationId) {
+        if (sshHost && sshHost !== 'all') {
+          bindConversationSshHost(result.conversationId, sshHost);
+        }
+        if (result.conversationId !== targetCid) {
+          convoQueues.delete(targetCid);
+          convoQueues.set(result.conversationId, [qItem]);
+        }
       }
       void syncClientInBackground();
       sendCompressed(req, res, 200, 'application/json; charset=utf-8', JSON.stringify(result));

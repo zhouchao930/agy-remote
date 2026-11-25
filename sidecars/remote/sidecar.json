@@ -4,7 +4,7 @@
     "main.mjs"
   ],
   "env": {
-    "AGY_REMOTE_VERSION": "2.6.0"
+    "AGY_REMOTE_VERSION": "2.7.0"
   },
   "restart_policy": "always",
   "display_name": "移动端远程控制",

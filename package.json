@@ -1,6 +1,6 @@
 {
   "name": "agy-remote",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "description": "ZCode-style Mobile & Web Remote Control plugin for Google Antigravity 2.0",
   "type": "module",
   "license": "MIT",
