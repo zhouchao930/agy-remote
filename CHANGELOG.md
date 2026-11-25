@@ -1,72 +1,72 @@
-# Changelog & Version Iteration History — AGY Remote (`agy-remote`)
+# 版本迭代记录 (CHANGELOG) — AGY Remote (`agy-remote`)
 
-All notable architectural decisions, performance optimizations, security audits, and bug fixes across the `v1.0.0` → `v2.6.0` development lifecycle of **AGY Remote** are documented in this file.
+本文档完整记录了 **AGY Remote** 从 `v2.1.0` 到 `v2.6.0` 的架构演进、手机端性能优化、安全性与隐私审计以及核心问题修复历程。
 
 ---
 
 ## [v2.6.0] — 2026-11-25
-### Added
-- **Multi-Message Ordered Input Queue (`convoQueues`)**:
-  - Separated the mobile/web **Stop (`⏹`)** button (`#stopRunBtn`) from the **Send (`↑`)** button (`#sendPromptBtn`) in `lib/web-ui.mjs`.
-  - Users can continuously type and send multiple messages while the AI is still executing a turn, matching the native Antigravity desktop client experience.
-  - Added `convoQueues` in `sidecars/remote/main.mjs` (`POST /api/chat/send` queues messages with `status: 'queued'` when a turn is active, `processConversationQueues()` auto-dispatches queued prompts sequentially within 280ms of the previous turn finishing, and `POST /api/chat/queue-cancel` allows cancelling any queued item).
-  - Added visual queue badge (`⏳ 队列中 (等待上一条执行完成后自动发送)` + `✕ 取消`) in the mobile chat stream.
+### 新增功能
+- **多消息连续输入队列 (`convoQueues`)**：
+  - 在 `lib/web-ui.mjs` 中将手机端/网页端的**停止按钮 (`⏹`)** 与**发送按钮 (`↑`)** 彻底分离。
+  - 即使 AI 正在思考或执行工具，用户也可以像在桌面版 Antigravity 客户端一样，在手机输入框连续输入并发送多条指令进入排队队列。
+  - 在 `sidecars/remote/main.mjs` 中新增会话级有序队列 `convoQueues`：当上一轮任务仍在执行时，`POST /api/chat/send` 自动将新消息标记为 `queued`（排队中）；后台调度器 `processConversationQueues()` 会在上一轮结束后的 `280ms` 内自动按序将队列中的下一条指令推入桌面端执行；支持通过 `POST /api/chat/queue-cancel` 随时取消排队中的消息。
+  - 手机聊天流底部实时展示排队状态条（`⏳ 队列中 (等待上一条执行完成后自动发送)` + `✕ 取消` 按钮）。
 
-### Fixed
-- **Zero Duplicate Turn Rendering**:
-  - Fixed a bug in `lib/bridge.mjs` where out-of-slice steps (`!st`) or `<SYSTEM_MESSAGE>` notifications inside `agentState.turns` were misidentified as new `userInput` turn starts (`memTurnStart > diskLastStart`), which previously caused finished turns to be duplicated at the bottom of the screen.
-  - Added strict DOM turn reconciliation in `lib/web-ui.mjs` to remove temporary optimistic turn nodes (`turn-pending-*` / `turn-q-*`) immediately when superseded by persisted disk turns (`turn-<step_index>`).
+### 问题修复
+- **彻底解决“过去已输出内容在屏幕底部重复渲染一次”的 Bug**：
+  - 修复了 `lib/bridge.mjs` 在扫描桌面端内存 `agentState.turns` 时，将分片边界外缺失的步骤（`!st`）或系统后台消息（`<SYSTEM_MESSAGE>`）误判为新的 `userInput` 轮次起点（导致 `memTurnStart > diskLastStart` 误触发），从而在已完成轮次下方又追加一遍重复气泡的问题。
+  - 在 `lib/web-ui.mjs` 中加入严格的 **DOM 轮次对账（Reconciliation）与同文本自动去重机制**：一旦磁盘真实轮次（`turn-<step_index>`）落盘生成，立即销毁临时乐观占位节点（`turn-pending-*` / `turn-q-*`），确保每个问答轮次在屏幕上唯一显示。
 
 ---
 
 ## [v2.5.1] — 2026-11-25
-### Fixed
-- **Eliminated Raw Unrendered Text Flash on Message Send**:
-  - Removed the legacy `document.querySelectorAll('[data-markdown-root]')` `.innerText` scraping fallback in `lib/bridge.mjs` that briefly flashed raw unformatted DOM text before the new turn's structured steps initialized.
-  - Filtered `<SYSTEM_MESSAGE>` and `<ADDITIONAL_METADATA>` blocks out of `cleanUserPrompt` and skipped non-user system turns in `getConversationMessages`.
-- **Single-Turn Delta Transmission (`deltaOnly: true`)**:
-  - Reduced payload size from ~85KB full conversation history to ~1.2KB incremental delta (`deltaTurns: turns.slice(-4)` + `allTurnIds`) on SSE push and polling ticks.
-- **Persistent Cloudflare Edge Tunnel across Reinstalls**:
-  - Saved active detached `cloudflared.exe` session (`pid`, `url`, `port`) to `plugin_data/agy-remote/tunnel-session.json` so updating or restarting the sidecar reuses the warm Edge tunnel immediately without waiting 8–15s for DNS propagation.
+### 问题修复与性能优化
+- **消除发送消息后短暂闪现“未渲染原始文字”的问题**：
+  - 移除了 `lib/bridge.mjs` 中旧版通过 `document.querySelectorAll('[data-markdown-root]')` 抓取 `.innerText` 的兜底逻辑（该逻辑在首轮结构化步骤尚未生成的前几秒会把不带格式的 DOM 纯文本直接刷到屏幕上）。
+  - 在 `cleanUserPrompt` 中过滤掉 `<SYSTEM_MESSAGE>` 和 `<ADDITIONAL_METADATA>` 标签，并在 `getConversationMessages` 中跳过非用户发起的系统通知步骤。
+- **单轮增量传输协议 (`deltaOnly: true`)**：
+  - 将手机端高频轮询与 SSE 推送的数据包从全量历史（约 `85KB`）瘦身为仅包含最后活跃轮次的增量包（`deltaTurns` + `allTurnIds`，仅约 `1.2KB`），大幅降低手机 5G 网络下的解析耗时。
+- **跨更新/重启复用 Cloudflare 持久隧道 (`tunnel-session.json`)**：
+  - 将独立后台进程 `cloudflared.exe` 的会话信息（`pid`、`url`、`port`）持久化到 `plugin_data/agy-remote/tunnel-session.json`。插件热更新或重启时直接毫秒级复用已有公网隧道，无需重新等待 8~15 秒的公网 DNS 注册。
 
 ---
 
 ## [v2.4.0] — 2026-11-25
-### Added
-- **0-RTT Initial HTML State Hydration & SSE Push**:
-  - Embedded AES-256-GCM encrypted `initialState` directly inside the initial `/remote/v4` HTML document (`window.__AGY_INITIAL_STATE__`), eliminating 3 sequential round-trips on mobile load.
-  - Upgraded `/api/events` SSE stream to push encrypted `event: state` delta frames every `280ms` when active.
-- **CDP Target Caching & Parallel Evaluation**:
-  - Cached `findAllHubCdpTargets()` for 3 seconds and switched `evaluateInAllHubs` from serial `for...of` to `Promise.all` in `lib/bridge.mjs`.
-- **Smooth `requestAnimationFrame` Streaming**:
-  - Throttled mobile DOM patches in `lib/web-ui.mjs` with `requestAnimationFrame` + payload fingerprint checks (`lastRenderHash`) and client-side optimistic prompt rendering.
+### 新增功能与架构提速
+- **0-RTT 首屏加密数据直出与 280ms 级 SSE 实时帧推送**：
+  - 在首次请求 `/remote/v4` 返回 HTML 时，直接将 AES-256-GCM 加密后的首屏状态注入到 `window.__AGY_INITIAL_STATE__`，省去首屏加载后的 3 次串行网络往返（0-RTT 秒开）。
+  - 升级 `/api/events` SSE 通道，当检测到 AI 正在输出时，以 `280ms` 间隔主动推送加密后的 `event: state` 增量帧。
+- **CDP 目标缓存与全窗口并行查询**：
+  - 在 `lib/bridge.mjs` 中为 `findAllHubCdpTargets()` 增加 3 秒热缓存，并将 `evaluateInAllHubs` 从串行 `for...of` 改为 `Promise.all` 并行执行。
+- **手机端 `requestAnimationFrame` 帧级合并渲染**：
+  - 在 `lib/web-ui.mjs` 中引入内容指纹比对（`lastRenderHash`）与 `requestAnimationFrame` 合并渲染，配合发送瞬间的前端乐观预渲染（Optimistic UI），实现点击发送即刻上屏。
 
 ---
 
 ## [v2.3.1] — 2026-11-25
-### Fixed
-- **Seamless WeChat Scan to Mobile Browser Transition**:
-  - Kept `?sid=...&hash=...` in the browser address bar instead of stripping it via `history.replaceState`, and updated `checkAuth()` in `sidecars/remote/main.mjs` to validate `sid` (`d_<hash>`) signatures so tapping "Open in Default Browser" from WeChat never asks for a manual Security Token.
-- **Windows Double-Click Installer (`install.bat` & `uninstall.bat`)**:
-  - Added batch wrappers using `powershell.exe -NoProfile -ExecutionPolicy Bypass` to bypass default Windows PowerShell `Restricted` execution policies.
+### 问题修复
+- **微信扫码一键跳转手机系统浏览器免输 Token**：
+  - 保留 URL 地址栏中的 `?sid=...&hash=...` 签名参数（不再用 `history.replaceState` 抹除），并在 `sidecars/remote/main.mjs` 的 `checkAuth()` 中支持校验 `sid`（`d_<hash>`）签名。微信扫码后点击右上角“在默认浏览器中打开”可直接免密进入，不再弹窗要求手输安全 Token。
+- **Windows 双击一键安装器 (`install.bat` & `uninstall.bat`)**：
+  - 新增批处理启动器，自动携带 `-NoProfile -ExecutionPolicy Bypass` 调用 PowerShell，完美绕过 Windows 默认禁止直接运行 `.ps1` 脚本的策略限制。
 
 ---
 
 ## [v2.3.0] — 2026-11-25
-### Changed
-- **Minimalist 380px Bottom-Left QR Modal (`lib/sidebar-inject.mjs`)**:
-  - Removed all non-functional placeholder bot cards (WeChat/Feishu/Lark/Telegram) and removed the LAN toggle button.
-  - Added global singleton observer `globalThis.__agyRemoteObs` to prevent duplicate phone icons in the bottom-left status bar across hot reloads.
-- **Security & Privacy Hardening (Codex Audit Passed)**:
-  - Passed full security and privacy audit (`PRIVACY_LEAK_COUNT = 0`): zero personal IPs, tokens, or machine identifiers in the source tree; all runtime state is dynamically generated per host in `~/.gemini/antigravity/plugin_data/agy-remote/`.
-  - Enforced `timingSafeEqual` token validation, `HttpOnly; SameSite=Lax` session cookies, strict CSP headers, and AES-256-GCM payload encryption.
+### 优化与安全加固
+- **左下角极简 380px 扫码弹窗 (`lib/sidebar-inject.mjs`)**：
+  - 彻底移除弹窗中无法点击的虚拟渠道卡片（微信/飞书/Lark/Telegram 占位按钮）以及多余的局域网切换按钮，仅保留最核心的二维码、公网/Tailscale 状态标签与一键复制链接按钮。
+  - 引入全局单例观察者 `globalThis.__agyRemoteObs`，彻底解决多次热注入导致左下角出现多个重复绿色小手机图标的问题。
+- **Codex 安全性与隐私全量审查通过 (`PRIVACY_LEAK_COUNT = 0`)**：
+  - 确保源码与分享安装包中**零个人隐私信息**（不包含任何机器名、个人 Tailscale IP、静态 Token 或会话历史）；所有运行期密钥与隧道状态均在安装者本机的 `~/.gemini/antigravity/plugin_data/agy-remote/` 中动态生成。
+  - 启用 `crypto.timingSafeEqual` 防时序攻击 Token 校验、`HttpOnly; SameSite=Lax` 会话 Cookie、严格 CSP 响应头以及 AES-256-GCM 端到端载荷加密。
 
 ---
 
 ## [v2.1.0 – v2.2.0] — 2026-11-24
-### Added
-- **1:1 Native Antigravity Dark UI + ZCode Fast Core (`lib/web-ui.mjs`)**:
-  - Rebuilt the mobile/web interface to mirror the native Antigravity client (`#0e0f12` / `#131418` theme, flat conversation list + workspace grouped view, native `Steps` card, collapsible `Thought` block with tool pills, real Git/snapshot file diff drawer with `↩ 撤销修改` revert action, and real Redux model selector sync).
-- **Embedded Tailscale + Cloudflare High-Speed Edge (`lib/tailscale.mjs`, `lib/tunnel.mjs`)**:
-  - Completely removed Pinggy.
-  - Added automatic Tailscale detection/installation and persistent `cloudflared.exe` edge tunneling with Serveo port-443 fallback.
+### 核心架构发布
+- **1:1 复刻 Antigravity 原生暗黑 UI + ZCode 极速内核 (`lib/web-ui.mjs`)**：
+  - 完整复刻桌面端 `#0e0f12` / `#131418` 原生暗黑配色、左侧扁平会话列表 + 按工作区分组视图、顶部 `Steps` 步骤进度卡片、可折叠 `Thought` 思考过程与工具调用胶囊、真实文件 Diff 抽屉（支持 `↩ 撤销修改` 一键回滚）以及桌面端 Redux 真实模型列表同步切换。
+- **内嵌 Tailscale 组件 + Cloudflare High-Speed Edge 公网隧道 (`lib/tailscale.mjs`, `lib/tunnel.mjs`)**：
+  - 彻底移除不稳定的 Pinggy 隧道。
+  - 支持在宿主机自动检测与静默部署 Tailscale 组件（动态读取安装者本机的 `tailscale status --json` 虚拟网卡地址），并配备守护进程级 `cloudflared.exe` 高速边缘公网隧道与 Serveo 443 端口自动兜底。
