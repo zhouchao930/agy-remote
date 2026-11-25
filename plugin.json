@@ -1,0 +1,12 @@
+{
+  "name": "agy-remote",
+  "displayName": "AGY Remote (ZCode Web)",
+  "version": "2.6.0",
+  "description": "Scan QR code on mobile or open on another PC to control this Antigravity client, chat with agents, edit workspace code, and run terminal commands via Web.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Show AGY Remote QR code and Web IDE URL",
+    "Check connected remote Web IDE devices",
+    "Configure AGY Remote workspace root"
+  ]
+}

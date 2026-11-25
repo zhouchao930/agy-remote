@@ -1,0 +1,26 @@
+{
+  "command": "node",
+  "args": [
+    "main.mjs"
+  ],
+  "env": {
+    "AGY_REMOTE_VERSION": "2.6.0"
+  },
+  "restart_policy": "always",
+  "display_name": "移动端远程控制",
+  "description": "Scan QR code or open web link on mobile or another PC to remotely control this Antigravity workspace.",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": false
+  },
+  "ui_config": {
+    "display_name": "移动端远程控制",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "移动端远程控制"
+      }
+    ]
+  }
+}
